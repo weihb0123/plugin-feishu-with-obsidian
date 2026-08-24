@@ -1,0 +1,10 @@
+{
+	"id": "oblark-sync",
+	"name": "ObLark Sync",
+	"version": "0.1.15",
+	"minAppVersion": "1.5.0",
+	"description": "Publish and sync Markdown notes to Feishu/Lark Docs via lark-cli.",
+	"author": "wanghuan",
+	"authorUrl": "",
+	"isDesktopOnly": true
+}
