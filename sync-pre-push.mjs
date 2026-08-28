@@ -34,7 +34,7 @@ import {
 
 const execFileAsync = promisify(execFile);
 
-const PLUGIN_ID = "oblark-sync";
+const PLUGIN_ID = "oblark-syncV2";
 const LARK_SYNC_STATE_FILE_NAME = "lark-sync-state.json";
 const ZERO_REF = "0000000000000000000000000000000000000000";
 const MAX_STDERR_LENGTH = 1600;
