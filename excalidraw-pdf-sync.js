@@ -1,12 +1,34 @@
 "use strict";
 
+const crypto = require("crypto");
 const fs = require("fs/promises");
 const os = require("os");
 const path = require("path");
+
 const EXCALIDRAW_PLUGIN_ID = "obsidian-excalidraw-plugin";
 const BINDINGS_KEY = "excalidrawPdfBindings";
+const PREVIEW_MARKER = "oblark-excalidraw";
+// Excalidraw 导出对话框最高倍率是 3x，失败时按阶梯有限降级（每次降级都会写日志）
+const PREVIEW_EXPORT_SCALES = [3, 2, 1];
+const PREVIEW_EXPORT_SETTINGS = { withBackground: true, withTheme: true, isMask: false };
+// 导出配置指纹：变化时旧 binding 会被判定为需要重新导出
+const EXPORT_CONFIG_ID = "png-ladder-3-2-1:bg+theme";
+// 飞书素材上传上限 20MB，留出余量
+const PREVIEW_MAX_BYTES = 18 * 1024 * 1024;
+// Chromium canvas 单边上限，超过说明该倍率渲染不可靠
+const PREVIEW_MAX_EDGE = 16384;
+// 与 main.js 内联媒体替换用的正则保持一致，保证 map key 与被替换文本完全相同
+const WIKILINK_PATTERN = /!?\[\[[^\]|]+(?:\|[^\]]+)?\]\]/g;
+
 const pendingExports = new Map();
+const pendingPreviews = new Map();
+/** drawingPath -> preview */
+const previewCache = new Map();
+/** 虚拟媒体文件名 -> preview（供 MediaHandler.resolveMedia 命中） */
+const virtualMedia = new Map();
 let imageExportQueue = Promise.resolve();
+let previewDirectory = null;
+let mediaResolverPatched = false;
 
 function escapeXml(value) {
   return String(value)
@@ -16,24 +38,129 @@ function escapeXml(value) {
     .replace(/"/g, "&quot;");
 }
 
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function notifyUser(message) {
+  try {
+    const obsidian = require("obsidian");
+    if (obsidian && typeof obsidian.Notice === "function") new obsidian.Notice(message, 8000);
+  } catch {
+    /* 非 Obsidian 运行环境（单元测试）忽略 */
+  }
+}
+
+function positiveInteger(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number > 0 ? Math.round(number) : undefined;
+}
+
+function sha256(value) {
+  return crypto.createHash("sha256").update(String(value)).digest("hex");
+}
+
 function drawingTitle(file) {
   return file.basename.replace(/\.excalidraw$/i, "");
 }
 
-function findExcalidrawReferences(markdown, sourceFile, plugin) {
-  const references = [];
-  const seen = new Set();
-  const pattern = /!?\[\[([^\]|#]+?)(?:#[^\]|]+)?(?:\\?\|[^\]]+)?\]\]/g;
+/** 标记 fenced code block 与行内 code 的字符区间，避免改写代码里的 wikilink */
+function collectCodeRanges(markdown) {
+  const ranges = [];
+  let offset = 0;
+  let fence = null;
+
+  for (const line of String(markdown).split("\n")) {
+    const trimmed = line.trim();
+    const fenceMatch = /^(`{3,}|~{3,})/.exec(trimmed);
+    if (fence) {
+      ranges.push([offset, offset + line.length]);
+      if (fenceMatch && trimmed.startsWith(fence)) fence = null;
+    } else if (fenceMatch) {
+      fence = fenceMatch[1];
+      ranges.push([offset, offset + line.length]);
+    } else {
+      const inline = /`[^`\n]*`/g;
+      let match;
+      while ((match = inline.exec(line)) !== null) {
+        ranges.push([offset + match.index, offset + match.index + match[0].length]);
+      }
+    }
+    offset += line.length + 1;
+  }
+
+  return ranges;
+}
+
+function isInsideRanges(ranges, index) {
+  for (const [start, end] of ranges) {
+    if (index >= start && index < end) return true;
+  }
+  return false;
+}
+
+function parseWikiLinkTarget(matched) {
+  const inner = /^!?\[\[([\s\S]+)\]\]$/.exec(matched);
+  if (!inner) return "";
+  let target = inner[1];
+  const alias = target.indexOf("|");
+  if (alias >= 0) target = target.slice(0, alias).replace(/\\$/, "");
+  const heading = target.indexOf("#");
+  if (heading >= 0) target = target.slice(0, heading);
+  return target.trim();
+}
+
+function resolveDrawingFile(plugin, target, sourceFile) {
+  if (!target) return null;
+  const candidates = [target];
+  if (!/\.excalidraw(\.md)?$/i.test(target)) {
+    candidates.push(`${target}.excalidraw`, `${target}.excalidraw.md`);
+  }
+  for (const candidate of candidates) {
+    let file = null;
+    try {
+      file = plugin.resolveWikiLinkTargetFile(candidate, sourceFile);
+    } catch {
+      file = null;
+    }
+    if (file && typeof file.path === "string" && plugin.isExcalidrawDrawing(file)) return file;
+  }
+  return null;
+}
+
+/**
+ * 收集 markdown 中所有指向 Excalidraw 绘图的 wikilink。
+ * 返回 [{ file, occurrences: [被匹配的原始文本, ...] }]
+ */
+function collectExcalidrawReferences(markdown, sourceFile, plugin) {
+  if (typeof markdown !== "string" || !markdown) return [];
+  const ranges = collectCodeRanges(markdown);
+  const resolved = new Map();
+  const references = new Map();
+  const pattern = new RegExp(WIKILINK_PATTERN.source, "g");
   let match;
 
   while ((match = pattern.exec(markdown)) !== null) {
-    const target = plugin.resolveWikiLinkTargetFile(match[1].trim(), sourceFile);
-    if (!target || typeof target.path !== "string" || !plugin.isExcalidrawDrawing(target) || seen.has(target.path)) continue;
-    seen.add(target.path);
-    references.push(target);
+    if (isInsideRanges(ranges, match.index)) continue;
+    const target = parseWikiLinkTarget(match[0]);
+    if (!target) continue;
+    if (!resolved.has(target)) resolved.set(target, resolveDrawingFile(plugin, target, sourceFile));
+    const file = resolved.get(target);
+    if (!file) continue;
+    let entry = references.get(file.path);
+    if (!entry) {
+      entry = { file, occurrences: [] };
+      references.set(file.path, entry);
+    }
+    if (!entry.occurrences.includes(match[0])) entry.occurrences.push(match[0]);
   }
 
-  return references;
+  return Array.from(references.values());
+}
+
+/** 兼容旧签名：仅返回被引用的绘图文件列表 */
+function findExcalidrawReferences(markdown, sourceFile, plugin) {
+  return collectExcalidrawReferences(markdown, sourceFile, plugin).map((entry) => entry.file);
 }
 
 async function withImageExportLock(callback) {
@@ -50,61 +177,235 @@ async function withImageExportLock(callback) {
   }
 }
 
-async function exportDrawingToImage(plugin, file, outputDirectory) {
-  return withImageExportLock(async () => {
-    const excalidraw = plugin.app.plugins.getPlugin(EXCALIDRAW_PLUGIN_ID);
-    const automate = globalThis.ExcalidrawAutomate;
-    if (!excalidraw || !automate?.getAPI) throw new Error("Excalidraw 插件未启用，无法导出图片");
+async function ensurePreviewDirectory() {
+  if (previewDirectory) return previewDirectory;
+  previewDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "oblark-sync-excalidraw-"));
+  return previewDirectory;
+}
 
-    const outputPath = path.join(outputDirectory, `${plugin.sanitizeFileName(drawingTitle(file))}.png`);
-    const ea = automate.getAPI();
+async function cleanupPreviewDirectory() {
+  const directory = previewDirectory;
+  previewDirectory = null;
+  previewCache.clear();
+  virtualMedia.clear();
+  if (!directory) return;
+  try {
+    await fs.rm(directory, { force: true, recursive: true });
+  } catch (error) {
+    console.warn(`[ObLark Sync] 清理 Excalidraw 预览临时目录失败：${describeError(error)}`);
+  }
+}
 
-    try {
-      const image = await ea.createPNG(file.path, 2, {
-        withBackground: true,
-        withTheme: true,
-        isMask: false,
-      });
-      if (!image) throw new Error(`Excalidraw 无法渲染：${file.path}`);
-      const bytes = image instanceof ArrayBuffer
-        ? new Uint8Array(image)
-        : ArrayBuffer.isView(image)
-          ? new Uint8Array(image.buffer, image.byteOffset, image.byteLength)
-          : new Uint8Array(await image.arrayBuffer());
-      await fs.writeFile(outputPath, bytes);
-      return outputPath;
-    } finally {
-      ea.destroy?.();
+function readPngSize(bytes) {
+  if (!bytes || bytes.length < 24) return null;
+  if (bytes[0] !== 137 || bytes[1] !== 80 || bytes[2] !== 78 || bytes[3] !== 71) return null;
+  const view = Buffer.from(bytes.buffer || bytes, bytes.byteOffset || 0, bytes.length);
+  return { width: view.readUInt32BE(16), height: view.readUInt32BE(20) };
+}
+
+async function toUint8Array(image) {
+  if (image instanceof ArrayBuffer) return new Uint8Array(image);
+  if (ArrayBuffer.isView(image)) return new Uint8Array(image.buffer, image.byteOffset, image.byteLength);
+  if (typeof image.arrayBuffer === "function") return new Uint8Array(await image.arrayBuffer());
+  throw new Error("Excalidraw 返回了无法识别的图片数据类型");
+}
+
+function resolveExcalidrawApi(plugin, file) {
+  const excalidraw = plugin.app?.plugins?.getPlugin?.(EXCALIDRAW_PLUGIN_ID);
+  if (!excalidraw) throw new Error(`Excalidraw 插件未启用，无法导出图片：${file.path}`);
+  const automate = globalThis.ExcalidrawAutomate;
+  if (!automate) throw new Error(`ExcalidrawAutomate API 不可用，无法导出图片：${file.path}`);
+  const api = typeof automate.getAPI === "function" ? automate.getAPI() : automate;
+  if (!api || typeof api.createPNG !== "function") {
+    throw new Error(`ExcalidrawAutomate.createPNG 不可用，无法导出图片：${file.path}`);
+  }
+  return { api, owned: api !== automate };
+}
+
+/** 按最高画质优先的倍率阶梯导出 PNG；降级必须留日志，不允许静默降质 */
+async function renderDrawingPng(plugin, file) {
+  const { api, owned } = resolveExcalidrawApi(plugin, file);
+  const problems = [];
+  const lastScale = PREVIEW_EXPORT_SCALES[PREVIEW_EXPORT_SCALES.length - 1];
+
+  try {
+    for (const scale of PREVIEW_EXPORT_SCALES) {
+      let bytes;
+      try {
+        const image = await api.createPNG(file.path, scale, { ...PREVIEW_EXPORT_SETTINGS });
+        if (!image) throw new Error("createPNG 返回空结果");
+        bytes = await toUint8Array(image);
+        if (bytes.length === 0) throw new Error("createPNG 返回空数据");
+      } catch (error) {
+        problems.push(`scale=${scale}: ${describeError(error)}`);
+        console.error(`[ObLark Sync] Excalidraw 导出失败（scale=${scale}）：${file.path}`, error);
+        continue;
+      }
+
+      const size = readPngSize(bytes);
+      const tooLarge = bytes.length > PREVIEW_MAX_BYTES;
+      const tooWide = !!size && (size.width > PREVIEW_MAX_EDGE || size.height > PREVIEW_MAX_EDGE);
+      if ((tooLarge || tooWide) && scale !== lastScale) {
+        const reason = tooLarge ? `体积 ${bytes.length} 字节超过上限` : `尺寸 ${size.width}x${size.height} 超过上限`;
+        problems.push(`scale=${scale}: ${reason}`);
+        console.warn(`[ObLark Sync] Excalidraw 画布过大，降级导出倍率：${file.path}（${reason}）`);
+        continue;
+      }
+
+      if (scale !== PREVIEW_EXPORT_SCALES[0]) {
+        console.warn(
+          `[ObLark Sync] Excalidraw 已降级为 scale=${scale} 导出：${file.path}（最高画质失败原因：${problems.join("; ")}）`,
+        );
+      }
+      return { bytes, exportScale: scale, width: size?.width, height: size?.height };
     }
+  } finally {
+    if (owned) api.destroy?.();
+  }
+
+  throw new Error(`Excalidraw PNG 导出失败：${file.path}（${problems.join("; ") || "未知原因"}）`);
+}
+
+async function readDrawingSource(plugin, file) {
+  const vault = plugin.app?.vault;
+  if (vault?.cachedRead) return vault.cachedRead(file);
+  if (vault?.read) return vault.read(file);
+  throw new Error(`无法读取 Excalidraw 源文件：${file.path}`);
+}
+
+function buildPreviewFilename(plugin, file, sourceHash) {
+  const base = plugin.sanitizeFileName(drawingTitle(file)) || "excalidraw";
+  return `${base}.${PREVIEW_MARKER}-${sourceHash.slice(0, 12)}.png`;
+}
+
+async function pathExists(target) {
+  try {
+    await fs.access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * 保证绘图存在一份与当前内容一致的高清 PNG。
+ * 内容未变化时直接复用缓存，不重复导出（同一批次的重复引用同样只导出一次）。
+ */
+async function ensureDrawingPreview(plugin, file, force = false) {
+  const sourceHash = sha256(await readDrawingSource(plugin, file));
+  const cached = previewCache.get(file.path);
+  if (!force && cached && cached.sourceHash === sourceHash && (await pathExists(cached.absolutePath))) {
+    virtualMedia.set(cached.filename, cached);
+    return cached;
+  }
+
+  const key = `${file.path}:${sourceHash}`;
+  const inflight = pendingPreviews.get(key);
+  if (inflight && !force) return inflight;
+
+  const task = (async () => {
+    const rendered = await withImageExportLock(() => renderDrawingPng(plugin, file));
+    const directory = await ensurePreviewDirectory();
+    const filename = buildPreviewFilename(plugin, file, sourceHash);
+    const absolutePath = path.join(directory, filename);
+    await fs.writeFile(absolutePath, rendered.bytes);
+
+    const preview = {
+      drawingPath: file.path,
+      filename,
+      absolutePath,
+      sourceHash,
+      exportScale: rendered.exportScale,
+      exportConfig: EXPORT_CONFIG_ID,
+      width: rendered.width,
+      height: rendered.height,
+      byteLength: rendered.bytes.length,
+    };
+
+    const previous = previewCache.get(file.path);
+    if (previous && previous.absolutePath !== absolutePath) {
+      virtualMedia.delete(previous.filename);
+      await fs.rm(previous.absolutePath, { force: true }).catch(() => {});
+    }
+    previewCache.set(file.path, preview);
+    virtualMedia.set(filename, preview);
+    console.info(
+      `[ObLark Sync] Excalidraw 预览已导出：${file.path} → ${filename}（scale=${preview.exportScale}, ${preview.width ?? "?"}x${preview.height ?? "?"}）`,
+    );
+    return preview;
+  })().finally(() => {
+    if (pendingPreviews.get(key) === task) pendingPreviews.delete(key);
+  });
+
+  pendingPreviews.set(key, task);
+  return task;
+}
+
+/**
+ * 把笔记里的 Excalidraw wikilink 改写为指向导出 PNG 的图片嵌入。
+ * 后续沿用主插件既有的媒体链路（resolveMedia → uploadMediaInline → <img/>），
+ * 因此图片 token 天然属于父文档，不存在跨文档 token 作用域问题。
+ * 任何一步失败都保持原文本不变，退回旧的飞书子文档链接行为。
+ */
+async function prepareMarkdownForExcalidraw(plugin, markdown, sourceFile) {
+  if (!mediaResolverPatched) return markdown;
+  if (typeof markdown !== "string" || !markdown) return markdown;
+  if (!sourceFile || typeof sourceFile.path !== "string") return markdown;
+  if (plugin.isExcalidrawDrawing(sourceFile)) return markdown;
+
+  const references = collectExcalidrawReferences(markdown, sourceFile, plugin);
+  if (references.length === 0) return markdown;
+
+  const replacements = new Map();
+  for (const reference of references) {
+    try {
+      const preview = await ensureDrawingPreview(plugin, reference.file);
+      for (const occurrence of reference.occurrences) {
+        replacements.set(occurrence, `![[${preview.filename}]]`);
+      }
+    } catch (error) {
+      const message = `Excalidraw 预览生成失败，${reference.file.path} 退回飞书子文档链接：${describeError(error)}`;
+      console.error(`[ObLark Sync] ${message}`, error);
+      notifyUser(message);
+    }
+  }
+  if (replacements.size === 0) return markdown;
+
+  const ranges = collectCodeRanges(markdown);
+  const pattern = new RegExp(WIKILINK_PATTERN.source, "g");
+  return markdown.replace(pattern, (matched, offset) => {
+    if (isInsideRanges(ranges, offset)) return matched;
+    return replacements.get(matched) ?? matched;
   });
 }
 
-async function uploadDrawingImage(plugin, file, documentToken, tempDirectory) {
-  const imagePath = await exportDrawingToImage(plugin, file, tempDirectory);
+/** 上传绘图 PNG 到指定飞书文档，并返回结构化结果 */
+async function uploadDrawingImage(plugin, file, documentToken, tempDirectory, preview) {
+  const resolved = preview || (await ensureDrawingPreview(plugin, file));
   const filename = `${drawingTitle(file)}.png`;
   const attachmentsDirectory = path.join(tempDirectory, "attachments");
   const uploadFilename = plugin.sanitizeFileName(filename);
   await fs.mkdir(attachmentsDirectory, { recursive: true });
-  await fs.copyFile(imagePath, path.join(attachmentsDirectory, uploadFilename));
+  await fs.copyFile(resolved.absolutePath, path.join(attachmentsDirectory, uploadFilename));
 
   const media = {
     type: "image",
     original: `EXCALIDRAW-IMAGE:${file.path}`,
     filename,
-    absolutePath: imagePath,
+    absolutePath: resolved.absolutePath,
     uploadFilename,
   };
   const uploaded = await plugin.uploadMediaInline(documentToken, [media], tempDirectory, "Excalidraw Image");
   const resource = uploaded.get(media.original);
-  if (!resource) throw new Error(`Excalidraw 图片上传失败：${file.path}`);
+  if (!resource || !resource.token) throw new Error(`Excalidraw 图片上传失败：${file.path}`);
 
-  const dimensions = resource.width && resource.height
-    ? ` width="${resource.width}" height="${resource.height}"`
-    : "";
+  const width = positiveInteger(resource.width) ?? positiveInteger(resolved.width);
+  const height = positiveInteger(resource.height) ?? positiveInteger(resolved.height);
+  const dimensions = width && height ? ` width="${width}" height="${height}"` : "";
   const xml = [
     `<title>${escapeXml(drawingTitle(file))}</title>`,
     "<p>Excalidraw 绘图预览</p>",
-    `<img src="${escapeXml(resource.token)}" name="${escapeXml(filename)}"${dimensions}/>`
+    `<img src="${escapeXml(resource.token)}" name="${escapeXml(filename)}"${dimensions}/>`,
   ].join("\n");
   await fs.writeFile(path.join(tempDirectory, "excalidraw.xml"), xml, "utf8");
   await plugin.runLarkCli([
@@ -112,9 +413,23 @@ async function uploadDrawingImage(plugin, file, documentToken, tempDirectory) {
     "--doc", documentToken, "--command", "overwrite", "--doc-format", "xml",
     "--content", "@excalidraw.xml",
   ], { cwd: tempDirectory });
+
+  return {
+    imageToken: resource.token,
+    width,
+    height,
+    filename,
+    exportScale: resolved.exportScale,
+    sourceHash: resolved.sourceHash,
+    exportConfig: resolved.exportConfig || EXPORT_CONFIG_ID,
+  };
 }
 
-async function createDrawingDocument(plugin, file, parent) {
+/**
+ * 创建绘图子文档。
+ * preview 传 undefined 表示自动导出；显式传 null 表示降级：只建占位骨架、不上传图片。
+ */
+async function createDrawingDocument(plugin, file, parent, preview) {
   const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "oblark-sync-excalidraw-"));
   try {
     const title = drawingTitle(file);
@@ -137,8 +452,12 @@ async function createDrawingDocument(plugin, file, parent) {
     const documentToken = document?.document_id;
     const url = wikiNode?.url || document?.url || response.data?.url;
     if (!documentToken || !url) throw new Error("创建 Excalidraw 飞书文档失败");
-    await uploadDrawingImage(plugin, file, documentToken, tempDirectory);
-    return { token: documentToken, documentToken, url };
+    if (preview === null) {
+      console.warn(`[ObLark Sync] ${file.path} 仅创建了占位子文档，下次同步会补齐预览图`);
+      return { token: documentToken, documentToken, url };
+    }
+    const image = await uploadDrawingImage(plugin, file, documentToken, tempDirectory, preview);
+    return { token: documentToken, documentToken, url, ...image };
   } finally {
     await fs.rm(tempDirectory, { force: true, recursive: true });
   }
@@ -155,45 +474,91 @@ function directDocumentBinding(binding) {
   return token ? { ...binding, token } : null;
 }
 
-async function updateDrawingDocument(plugin, file, binding) {
+async function updateDrawingDocument(plugin, file, binding, preview) {
   const tempDirectory = await fs.mkdtemp(path.join(os.tmpdir(), "oblark-sync-excalidraw-"));
   try {
     const token = tokenFromBinding(binding);
     if (!token) throw new Error(`无法解析 Excalidraw 飞书文档 token：${file.path}`);
-    await uploadDrawingImage(plugin, file, token, tempDirectory);
-    return { ...binding, documentToken: token };
+    const image = await uploadDrawingImage(plugin, file, token, tempDirectory, preview);
+    return { ...binding, documentToken: token, ...image };
   } finally {
     await fs.rm(tempDirectory, { force: true, recursive: true });
   }
 }
 
+/** 写入 binding，保留用户已有的 documentToken / url，不因缺字段丢数据 */
 async function persistBinding(plugin, file, binding) {
   plugin.settings[BINDINGS_KEY] ||= {};
-  plugin.settings[BINDINGS_KEY][file.path] = {
-    token: binding.token,
-    documentToken: binding.documentToken,
-    url: binding.url,
-    sourceMtime: file.stat.mtime,
+  const previous = plugin.settings[BINDINGS_KEY][file.path] || {};
+  const next = {
+    token: binding.token || previous.token,
+    documentToken: binding.documentToken || previous.documentToken,
+    url: binding.url || previous.url,
+    imageToken: binding.imageToken || previous.imageToken,
+    width: positiveInteger(binding.width) ?? positiveInteger(previous.width),
+    height: positiveInteger(binding.height) ?? positiveInteger(previous.height),
+    sourceMtime: file.stat?.mtime,
+    sourceHash: binding.sourceHash || previous.sourceHash,
+    exportScale: binding.exportScale ?? previous.exportScale,
+    exportConfig: binding.exportConfig || previous.exportConfig,
   };
+  plugin.settings[BINDINGS_KEY][file.path] = next;
   await plugin.saveSettings();
-  return { ...binding, transientExcalidrawPdf: true };
+  return { ...binding, ...next, transientExcalidrawPdf: true };
 }
 
-async function syncDrawing(plugin, file, parent, originalGetBinding, force = false) {
-  const key = `${file.path}:${file.stat.mtime}:${force}`;
+/**
+ * 是否需要重新导出并上传。
+ * 不只看 mtime：缺 imageToken / 缺 sourceHash / 内容 hash 变化 / 导出配置变化都会触发。
+ */
+function needsDrawingRefresh(stored, file, sourceHash, force = false) {
+  if (force) return { refresh: true, reason: "force" };
+  if (!stored) return { refresh: true, reason: "missing-binding" };
+  if (!stored.imageToken) return { refresh: true, reason: "missing-image-token" };
+  if (!stored.sourceHash) return { refresh: true, reason: "missing-source-hash" };
+  if (stored.sourceHash !== sourceHash) return { refresh: true, reason: "source-changed" };
+  if (stored.exportConfig !== EXPORT_CONFIG_ID) return { refresh: true, reason: "export-config-changed" };
+  return { refresh: false, reason: "up-to-date" };
+}
+
+async function syncDrawing(plugin, file, parent, originalGetBinding, force = false, fallbackBinding, degradeOnFailure = true) {
+  const sourceHash = sha256(await readDrawingSource(plugin, file));
+  const key = `${file.path}:${sourceHash}:${force}`;
   if (pendingExports.has(key)) return pendingExports.get(key);
 
   const task = (async () => {
-    const stored = plugin.settings[BINDINGS_KEY]?.[file.path];
-    let binding = stored || directDocumentBinding(originalGetBinding.call(plugin, file));
+    const stored = plugin.settings?.[BINDINGS_KEY]?.[file.path];
+    let binding = stored
+      || directDocumentBinding(originalGetBinding.call(plugin, file))
+      || (fallbackBinding && tokenFromBinding(fallbackBinding) ? fallbackBinding : null);
     if (binding && !await plugin.validateRemoteBinding(binding)) binding = null;
-    if (!force && binding && stored?.sourceMtime === file.stat.mtime) {
+
+    const decision = needsDrawingRefresh(binding === stored ? stored : null, file, sourceHash, force);
+    if (binding && !decision.refresh) {
+      if (stored.sourceMtime !== file.stat?.mtime) {
+        stored.sourceMtime = file.stat?.mtime;
+        await plugin.saveSettings();
+      }
       return { ...binding, transientExcalidrawPdf: true };
+    }
+    console.info(`[ObLark Sync] Excalidraw 需要刷新（${decision.reason}）：${file.path}`);
+
+    let preview;
+    try {
+      preview = await ensureDrawingPreview(plugin, file, force);
+    } catch (error) {
+      if (!degradeOnFailure) throw error;
+      // 导出失败：不动远端已有内容，退回子文档链接，并保留上一次有效 binding
+      const message = `Excalidraw 预览生成失败，${file.path} 保留原有远端内容：${describeError(error)}`;
+      console.error(`[ObLark Sync] ${message}`, error);
+      notifyUser(message);
+      if (binding) return { ...binding, transientExcalidrawPdf: true };
+      return persistBinding(plugin, file, await createDrawingDocument(plugin, file, parent, null));
     }
 
     const result = binding
-      ? await updateDrawingDocument(plugin, file, binding)
-      : await createDrawingDocument(plugin, file, parent);
+      ? await updateDrawingDocument(plugin, file, binding, preview)
+      : await createDrawingDocument(plugin, file, parent, preview);
     return persistBinding(plugin, file, result);
   })().finally(() => pendingExports.delete(key));
 
@@ -201,7 +566,30 @@ async function syncDrawing(plugin, file, parent, originalGetBinding, force = fal
   return task;
 }
 
-function installExcalidrawPdfSync(PluginClass) {
+function installMediaResolverPatch(internals) {
+  const MediaHandler = internals?.MediaHandler;
+  if (typeof MediaHandler !== "function" || typeof MediaHandler.prototype?.resolveMedia !== "function") {
+    console.warn("[ObLark Sync] 未取到媒体解析器，Excalidraw 引用将退回飞书子文档链接模式");
+    return false;
+  }
+  if (MediaHandler.prototype.__oblarkExcalidrawPatched) {
+    mediaResolverPatched = true;
+    return true;
+  }
+  const originalResolveMedia = MediaHandler.prototype.resolveMedia;
+  MediaHandler.prototype.resolveMedia = async function (unit, sourcePath) {
+    const preview = unit && typeof unit.filename === "string" ? virtualMedia.get(unit.filename) : undefined;
+    if (preview) {
+      return { ...unit, type: "image", vaultPath: "", absolutePath: preview.absolutePath, uploadFilename: "" };
+    }
+    return originalResolveMedia.call(this, unit, sourcePath);
+  };
+  MediaHandler.prototype.__oblarkExcalidrawPatched = true;
+  mediaResolverPatched = true;
+  return true;
+}
+
+function installExcalidrawPdfSync(PluginClass, internals) {
   if (!PluginClass || PluginClass.prototype.__excalidrawPdfSyncInstalled) return;
   const prototype = PluginClass.prototype;
   prototype.__excalidrawPdfSyncInstalled = true;
@@ -212,10 +600,14 @@ function installExcalidrawPdfSync(PluginClass) {
   const originalUpdateDocument = prototype.updateLarkDocument;
   const originalSyncFileInternal = prototype.syncFileInternal;
   const originalShouldWriteBinding = prototype.shouldWriteBinding;
+  const originalReadNote = prototype.readNoteForLark;
+  const originalOnunload = prototype.onunload;
 
   console.info("[ObLark Sync] Installing Excalidraw image sync hooks");
+  installMediaResolverPatch(internals);
 
   prototype.isExcalidrawDrawing = function (file) {
+    if (!file || typeof file.path !== "string") return false;
     const excalidraw = this.app.plugins.getPlugin(EXCALIDRAW_PLUGIN_ID);
     if (excalidraw?.isExcalidrawFile?.(file)) return true;
     if (file.path.toLowerCase().endsWith(".excalidraw.md")) return true;
@@ -224,7 +616,7 @@ function installExcalidrawPdfSync(PluginClass) {
 
   prototype.getBinding = function (file) {
     if (this.isExcalidrawDrawing(file)) {
-      const stored = this.settings[BINDINGS_KEY]?.[file.path];
+      const stored = this.settings?.[BINDINGS_KEY]?.[file.path];
       if (stored) return stored;
     }
     return originalGetBinding.call(this, file);
@@ -235,10 +627,24 @@ function installExcalidrawPdfSync(PluginClass) {
     return originalShouldWriteBinding.call(this, previous, next, enabled);
   };
 
+  // 唯一的内容改写入口：所有上行同步（单文件 / 目录发布 / 子文档）都经过 readNoteForLark
+  prototype.readNoteForLark = async function (file) {
+    const content = await originalReadNote.call(this, file);
+    try {
+      return await prepareMarkdownForExcalidraw(this, content, file);
+    } catch (error) {
+      console.error(`[ObLark Sync] Excalidraw 预处理失败，按原文同步：${file?.path}`, error);
+      return content;
+    }
+  };
+
+  // 兜底：若内容改写失败，wikilink 仍留在正文里，这里保证仍有子文档可引用（退回 cite）
   prototype.processWikiLinksForSubDocuments = async function (markdown, sourceFile, parent, visited) {
     const drawings = findExcalidrawReferences(markdown, sourceFile, this);
     if (drawings.length > 0) {
-      console.info(`[ObLark Sync] Found ${drawings.length} referenced Excalidraw drawing(s) in ${sourceFile.path}`);
+      console.info(
+        `[ObLark Sync] ${sourceFile.path} 中有 ${drawings.length} 个未内联的 Excalidraw 引用，退回子文档模式`,
+      );
     }
     for (const drawing of drawings) {
       await syncDrawing(this, drawing, parent, originalGetBinding);
@@ -254,16 +660,15 @@ function installExcalidrawPdfSync(PluginClass) {
   prototype.updateLarkDocument = async function (token, content, options) {
     const file = this.app.vault.getAbstractFileByPath(options.path);
     if (file && typeof file.path === "string" && this.isExcalidrawDrawing(file)) {
-      const binding = this.getBinding(file) || { token };
-      const result = await updateDrawingDocument(this, file, binding);
-      return persistBinding(this, file, result);
+      return syncDrawing(this, file, undefined, originalGetBinding, false, token ? { token } : undefined);
     }
     return originalUpdateDocument.call(this, token, content, options);
   };
 
   prototype.syncFileInternal = async function (file, options) {
     if (file && typeof file.path === "string" && this.isExcalidrawDrawing(file)) {
-      const result = await syncDrawing(this, file, undefined, originalGetBinding, true);
+      // 用户显式同步绘图本身：不做静默降级，失败要抛给上层提示
+      const result = await syncDrawing(this, file, undefined, originalGetBinding, true, undefined, false);
       if (options.showSuccess) this.showSuccess(this.t(options.successMessageKey || "noticeSyncedToLark"), result.url);
       if (options.openAfterSync) this.openUrlIfNeeded(result.url);
       return result;
@@ -275,6 +680,11 @@ function installExcalidrawPdfSync(PluginClass) {
     for (const drawing of findExcalidrawReferences(markdown, sourceFile, this)) {
       await syncDrawing(this, drawing, parent, originalGetBinding);
     }
+  };
+
+  prototype.onunload = function () {
+    cleanupPreviewDirectory().catch(() => {});
+    return originalOnunload?.call(this);
   };
 }
 
@@ -288,7 +698,7 @@ function scheduleExcalidrawPdfSyncInstall(pluginModule) {
         if (attempts < 50) setTimeout(install, 20);
         return false;
       }
-      installExcalidrawPdfSync(PluginClass);
+      installExcalidrawPdfSync(PluginClass, pluginModule?.__oblarkInternals);
       console.info("[ObLark Sync] Excalidraw image sync extension installed");
       return true;
     } catch (error) {
@@ -300,8 +710,31 @@ function scheduleExcalidrawPdfSyncInstall(pluginModule) {
   install();
 }
 
+/** 供测试使用：清空导出缓存与临时目录 */
+async function resetExcalidrawSyncCaches() {
+  pendingExports.clear();
+  pendingPreviews.clear();
+  await cleanupPreviewDirectory();
+}
+
 module.exports = {
   installExcalidrawPdfSync,
   scheduleExcalidrawPdfSyncInstall,
   findExcalidrawReferences,
+  collectExcalidrawReferences,
+  prepareMarkdownForExcalidraw,
+  ensureDrawingPreview,
+  uploadDrawingImage,
+  createDrawingDocument,
+  updateDrawingDocument,
+  persistBinding,
+  needsDrawingRefresh,
+  buildPreviewFilename,
+  parseWikiLinkTarget,
+  collectCodeRanges,
+  escapeXml,
+  resetExcalidrawSyncCaches,
+  EXPORT_CONFIG_ID,
+  PREVIEW_EXPORT_SCALES,
+  BINDINGS_KEY,
 };
