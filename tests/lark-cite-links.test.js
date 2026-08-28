@@ -167,3 +167,51 @@ test("下拉还原出的 \u{1F4C4} [标题](URL) 再推送时前缀一起收掉"
   const result = await cite.convertLarkLinksToCites(plugin, `见 \u{1F4C4} [项目方案](${DOCX_URL}) 结束`, noteFile);
   assert.equal(result, `见 <cite type="doc" doc-id="${DOCX_TOKEN}"></cite> 结束`);
 });
+
+/* ---------- 稳定性加固 ---------- */
+
+test("同一个 wiki 链接并发解析只调一次 API", async () => {
+  const plugin = createPlugin({
+    inspectResponse: { data: { wiki_node: { obj_token: DOCX_TOKEN, obj_type: "docx" } } },
+  });
+  const notes = [`甲 ${WIKI_URL}`, `乙 ${WIKI_URL}`, `丙 ${WIKI_URL}`];
+  const results = await Promise.all(notes.map((md) => cite.convertLarkLinksToCites(plugin, md, noteFile)));
+  for (const result of results) assert.match(result, new RegExp(`<cite type="doc" doc-id="${DOCX_TOKEN}"></cite>`));
+  assert.equal(plugin.cliCalls.length, 1, "并发时不应重复调用 drive +inspect");
+});
+
+test("wiki 缓存超上限时淘汰最旧条目，不会无限膨胀", async () => {
+  const plugin = createPlugin({
+    inspectResponse: { data: { wiki_node: { obj_token: DOCX_TOKEN, obj_type: "docx" } } },
+  });
+  const cache = {};
+  for (let index = 0; index < 520; index += 1) {
+    cache[`Wikcnfill${String(index).padStart(6, "0")}`] = { token: "x".repeat(12), type: "docx", checkedAt: index };
+  }
+  plugin.settings[cite.WIKI_CACHE_KEY] = cache;
+
+  await cite.convertLarkLinksToCites(plugin, `新链接 ${WIKI_URL}`, noteFile);
+  const stored = plugin.settings[cite.WIKI_CACHE_KEY];
+  assert.equal(Object.keys(stored).length, 500);
+  assert.equal(stored.Wikcnfill000000, undefined, "最旧的条目被淘汰");
+  assert.equal(stored[WIKI_TOKEN].token, DOCX_TOKEN, "新条目保留");
+});
+
+test("设置写盘失败时链接改写仍然生效", async () => {
+  const plugin = createPlugin({
+    inspectResponse: { data: { wiki_node: { obj_token: DOCX_TOKEN, obj_type: "docx" } } },
+  });
+  plugin.saveSettings = async () => {
+    throw new Error("disk full");
+  };
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  try {
+    const result = await cite.convertLarkLinksToCites(plugin, `方案 ${WIKI_URL}`, noteFile);
+    assert.match(result, new RegExp(`<cite type="doc" doc-id="${DOCX_TOKEN}"></cite>`));
+    assert.ok(warnings.some((line) => line.includes("写入 wiki token 缓存失败")));
+  } finally {
+    console.warn = originalWarn;
+  }
+});

@@ -17,6 +17,8 @@ const CITE_TYPE_DOC = "doc";
 const CITE_READY_OBJECT_TYPES = new Set(["docx"]);
 const LARK_HOST_SUFFIXES = ["feishu.cn", "feishu.net", "larksuite.com", "larkoffice.com"];
 const WIKI_CACHE_KEY = "larkWikiObjectTokenCache";
+/** 缓存条目上限，超出后淘汰最旧的（纯缓存，淘汰只影响一次多余的 API 调用） */
+const WIKI_CACHE_LIMIT = 500;
 /** 解析失败后的重试间隔，避免每次同步都打一次失败请求 */
 const WIKI_NEGATIVE_RETRY_MS = 24 * 60 * 60 * 1000;
 const TOKEN_PATTERN = /^[A-Za-z0-9]{10,}$/;
@@ -38,6 +40,8 @@ const TRAILING_PUNCTUATION = /[.,;:!?、，。；！？）】]+$/;
 const PULLED_DOC_PREFIX = "\u{1F4C4} ";
 
 let collectCodeRanges = null;
+/** 进行中的 wiki 解包任务，避免并发重复调用 */
+const pendingWikiLookups = new Map();
 try {
   ({ collectCodeRanges } = require("./excalidraw-pdf-sync.js"));
 } catch {
@@ -109,6 +113,16 @@ function readWikiCache(plugin) {
   return settings[WIKI_CACHE_KEY];
 }
 
+/** 纯缓存，超上限就淘汰最旧的；被淘汰的条目下次只是多调一次 API，无副作用 */
+function pruneWikiCache(cache) {
+  const keys = Object.keys(cache);
+  if (keys.length <= WIKI_CACHE_LIMIT) return;
+  keys
+    .sort((a, b) => (cache[a]?.checkedAt || 0) - (cache[b]?.checkedAt || 0))
+    .slice(0, keys.length - WIKI_CACHE_LIMIT)
+    .forEach((key) => delete cache[key]);
+}
+
 /** wiki 节点 token 不是底层文档 token，必须用 drive +inspect 解包（结果长期缓存） */
 async function resolveWikiObject(plugin, wikiToken, canonicalUrl) {
   const cache = readWikiCache(plugin);
@@ -116,26 +130,38 @@ async function resolveWikiObject(plugin, wikiToken, canonicalUrl) {
   if (cached?.token) return { token: cached.token, type: cached.type };
   if (cached && Date.now() - (cached.checkedAt || 0) < WIKI_NEGATIVE_RETRY_MS) return null;
 
-  let resolved = null;
-  try {
-    const response = await plugin.runLarkCli(["drive", "+inspect", "--as", "user", "--url", canonicalUrl]);
-    const node = response?.data?.wiki_node || response?.data?.node;
-    const token = node?.obj_token || response?.data?.token;
-    const type = node?.obj_type || response?.data?.type;
-    if (token && type) resolved = { token, type };
-  } catch (error) {
-    console.warn(`[ObLark Sync] wiki 链接解析失败，保留原始链接：${canonicalUrl}（${describeError(error)}）`);
-  }
+  // 目录发布时同一个 wiki 链接可能出现在多篇笔记里，并发时只查一次
+  const inflight = pendingWikiLookups.get(wikiToken);
+  if (inflight) return inflight;
 
-  cache[wikiToken] = resolved
-    ? { token: resolved.token, type: resolved.type, checkedAt: Date.now() }
-    : { checkedAt: Date.now() };
-  try {
-    await plugin.saveSettings();
-  } catch (error) {
-    console.warn(`[ObLark Sync] 写入 wiki token 缓存失败：${describeError(error)}`);
-  }
-  return resolved;
+  const task = (async () => {
+    let resolved = null;
+    try {
+      const response = await plugin.runLarkCli(["drive", "+inspect", "--as", "user", "--url", canonicalUrl]);
+      const node = response?.data?.wiki_node || response?.data?.node;
+      const token = node?.obj_token || response?.data?.token;
+      const type = node?.obj_type || response?.data?.type;
+      if (token && type) resolved = { token, type };
+    } catch (error) {
+      console.warn(`[ObLark Sync] wiki 链接解析失败，保留原始链接：${canonicalUrl}（${describeError(error)}）`);
+    }
+
+    cache[wikiToken] = resolved
+      ? { token: resolved.token, type: resolved.type, checkedAt: Date.now() }
+      : { checkedAt: Date.now() };
+    pruneWikiCache(cache);
+    try {
+      await plugin.saveSettings();
+    } catch (error) {
+      console.warn(`[ObLark Sync] 写入 wiki token 缓存失败：${describeError(error)}`);
+    }
+    return resolved;
+  })().finally(() => {
+    if (pendingWikiLookups.get(wikiToken) === task) pendingWikiLookups.delete(wikiToken);
+  });
+
+  pendingWikiLookups.set(wikiToken, task);
+  return task;
 }
 
 function buildCiteTag(token) {
@@ -292,6 +318,7 @@ function scheduleLarkCiteLinksInstall(pluginModule) {
       const PluginClass = pluginModule?.default;
       if (!PluginClass) {
         if (attempts < 50) setTimeout(install, 20);
+        else console.error("[ObLark Sync] 等待插件类超时，飞书链接引用扩展未安装");
         return false;
       }
       installLarkCiteLinks(PluginClass);

@@ -494,6 +494,77 @@ test("非 Excalidraw 文件仍走原始同步实现，toLinkTarget 未被改写"
   assert.equal(FakePlugin.prototype.toLinkTarget, undefined, "本方案不改写 toLinkTarget/cite 渲染");
 });
 
+test("同名普通笔记优先，不会被同名画图劫持；只有找不到时才补 .excalidraw 后缀", () => {
+  const note = new TFile("笔记/说明.md", "", undefined);
+  const plainNote = new TFile("草图.md", "普通笔记", undefined);
+  const shadowed = new TFile("草图.excalidraw.md", "src", DRAWING_FRONTMATTER);
+  const onlyDrawing = new TFile("草图2.excalidraw.md", "src", DRAWING_FRONTMATTER);
+  const plugin = new FakePlugin([note, plainNote, shadowed, onlyDrawing]);
+
+  assert.deepEqual(
+    sync.collectExcalidrawReferences("[[草图]]", note, plugin).map((entry) => entry.file.path),
+    [],
+    "[[草图]] 在 Obsidian 里指向 草图.md，不应被当成画图",
+  );
+  assert.deepEqual(
+    sync.collectExcalidrawReferences("[[草图2]]", note, plugin).map((entry) => entry.file.path),
+    ["草图2.excalidraw.md"],
+    "找不到同名文件时才补后缀",
+  );
+});
+
+/* ---------- 7. 稳定性加固 ---------- */
+
+test("导出失败不会卡死导出队列，后续导出仍能进行", async () => {
+  const vault = newVault();
+  let shouldFail = true;
+  installExcalidrawAutomate(() => {
+    if (shouldFail) throw new Error("render failed");
+    return pngBytes(800, 600);
+  });
+
+  await assert.rejects(() => sync.ensureDrawingPreview(vault.plugin, vault.drawing));
+  shouldFail = false;
+  // 队列若泄漏，这一步会永久挂起并被测试超时打死
+  const preview = await sync.ensureDrawingPreview(vault.plugin, vault.drawing);
+  assert.equal(preview.width, 800);
+});
+
+test("并发强制导出只跑一次渲染，且不留半成品文件", async () => {
+  const vault = newVault();
+  const state = installExcalidrawAutomate(() => pngBytes(1200, 900));
+  const [a, b, c] = await Promise.all([
+    sync.ensureDrawingPreview(vault.plugin, vault.drawing, true),
+    sync.ensureDrawingPreview(vault.plugin, vault.drawing, true),
+    sync.ensureDrawingPreview(vault.plugin, vault.drawing, true),
+  ]);
+  assert.equal(state.calls.length, 1, "同内容并发导出应合并成一次");
+  assert.equal(a.absolutePath, b.absolutePath);
+  assert.equal(b.absolutePath, c.absolutePath);
+  const bytes = fs.readFileSync(a.absolutePath);
+  assert.equal(bytes.readUInt32BE(16), 1200, "落盘的 PNG 必须是完整内容");
+  const leftovers = fs.readdirSync(path.dirname(a.absolutePath)).filter((name) => name.endsWith(".part"));
+  assert.deepEqual(leftovers, [], "不应残留原子写入的临时文件");
+});
+
+test("设置写盘失败不影响已经成功的远端同步", async () => {
+  const vault = newVault();
+  installExcalidrawAutomate(() => pngBytes(600, 400));
+  const warnings = [];
+  const originalWarn = console.warn;
+  console.warn = (...args) => warnings.push(args.join(" "));
+  vault.plugin.saveSettings = async () => {
+    throw new Error("disk full");
+  };
+  try {
+    const result = await vault.plugin.syncFileInternal(vault.drawing, {});
+    assert.equal(result.imageToken, "IMG_TOKEN_1", "远端已上传成功就要返回结果，而不是抛错");
+    assert.ok(warnings.some((line) => line.includes("保存设置失败")), "写盘失败必须留日志");
+  } finally {
+    console.warn = originalWarn;
+  }
+});
+
 test("escapeXml 转义 XML 关键字符", () => {
   assert.equal(sync.escapeXml('a&b<c>"d"'), "a&amp;b&lt;c&gt;&quot;d&quot;");
 });
