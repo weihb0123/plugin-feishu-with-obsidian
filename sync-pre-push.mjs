@@ -5,6 +5,7 @@ import { constants } from "fs";
 import { basename, dirname, join, resolve } from "path";
 import { tmpdir } from "os";
 import { promisify } from "util";
+import pushErrorReporter from "./push-error-reporter.js";
 import {
 	buildCommandEnvironment,
 	resolveLarkCliPathFromSetting,
@@ -33,8 +34,9 @@ import {
 } from "./lark-sync-core.mjs";
 
 const execFileAsync = promisify(execFile);
+const { appendPushErrorReport, getPushErrorReportPath } = pushErrorReporter;
 
-const PLUGIN_ID = "oblark-syncV2";
+const PLUGIN_ID = "oblark-sync";
 const LARK_SYNC_STATE_FILE_NAME = "lark-sync-state.json";
 const ZERO_REF = "0000000000000000000000000000000000000000";
 const MAX_STDERR_LENGTH = 1600;
@@ -59,10 +61,13 @@ const WINDOWS_NOTIFICATION_EXECUTABLE_ENV = "OBLARK_SYNC_POWERSHELL_PATH";
 let larkCliRequestQueue = Promise.resolve();
 let larkCliActiveRequestCount = 0;
 let lastLarkCliRequestAt = 0;
+let currentRepoRoot = "";
+const PUSH_ERROR_REPORTED = Symbol("oblarkPushErrorReported");
 
 async function main() {
-	const repoRoot = await git(["rev-parse", "--show-toplevel"]);
-	const settings = await readSettings(repoRoot.trim());
+	const repoRoot = (await git(["rev-parse", "--show-toplevel"])).trim();
+	currentRepoRoot = repoRoot;
+	const settings = await readSettings(repoRoot);
 	if (settings.autoSyncMode !== "pre-push") {
 		return;
 	}
@@ -72,14 +77,14 @@ async function main() {
 		return;
 	}
 
-	const syncState = await readSyncState(repoRoot.trim());
-	const tasks = await collectSyncTasks(repoRoot.trim(), files);
+	const syncState = await readSyncState(repoRoot);
+	const tasks = await collectSyncTasks(repoRoot, files);
 	const failure = await runWithConcurrency(groupTasksByDoc(tasks, syncState), MAX_PARALLEL_SYNCS, async (taskGroup) => {
 		for (const task of taskGroup) {
 			await syncMarkdownTask(task, settings, syncState);
 		}
 	});
-	await writeSyncState(repoRoot.trim(), syncState, settings);
+	await writeSyncState(repoRoot, syncState, settings);
 	if (failure) {
 		throw failure;
 	}
@@ -143,6 +148,7 @@ async function collectSyncTasks(repoRoot, files) {
 		}
 
 		return {
+			repoRoot,
 			filePath,
 			repoRelativePath: file,
 			content,
@@ -225,18 +231,19 @@ async function syncMarkdownTask(task, settings, syncState) {
 
 		await executeSyncPlanForTask(task, settings, syncState, syncDoc, contentForLark, plan, stateKeys, state?.revisionId);
 	} catch (error) {
-		if (error instanceof PrePushSyncError) {
-			throw error;
+		let failure = error;
+		if (!(error instanceof PrePushSyncError)) {
+			const detail = error instanceof Error ? error.message : String(error);
+			failure = new Error(formatSyncFailureMessage({
+				language: readLanguage(settings),
+				mode: "pre-push",
+				path: task.repoRelativePath,
+				reason: "lark-cli-failed",
+				detail
+			}));
 		}
-
-		const detail = error instanceof Error ? error.message : String(error);
-		throw new Error(formatSyncFailureMessage({
-			language: readLanguage(settings),
-			mode: "pre-push",
-			path: task.repoRelativePath,
-			reason: "lark-cli-failed",
-			detail
-		}));
+		await tryRecordPrePushError(task.repoRoot, failure, task.repoRelativePath, "document-update");
+		throw failure;
 	}
 }
 
@@ -923,7 +930,32 @@ async function readStdin() {
 	});
 }
 
+async function tryRecordPrePushError(repoRoot, error, filePath, stage) {
+	if (!repoRoot || error?.[PUSH_ERROR_REPORTED]) {
+		return;
+	}
+	try {
+		await appendPushErrorReport({
+			reportPath: getPushErrorReportPath(repoRoot, PLUGIN_ID),
+			error,
+			operation: "pre-push-sync",
+			stage,
+			filePath,
+			context: { mode: "pre-push" }
+		});
+		if (error && (typeof error === "object" || typeof error === "function")) {
+			Object.defineProperty(error, PUSH_ERROR_REPORTED, { value: true });
+		}
+	} catch (reportError) {
+		console.warn(
+			"[ObLark Sync] failed to write pre-push failure report; preserving original error:",
+			reportError instanceof Error ? reportError.message : String(reportError)
+		);
+	}
+}
+
 main().catch(async (error) => {
+	await tryRecordPrePushError(currentRepoRoot, error, "", "pre-push");
 	const message = error.message || String(error);
 	console.error(message);
 	await notifySystemFailure(message);

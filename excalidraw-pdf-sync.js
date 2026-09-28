@@ -12,11 +12,14 @@ const PREVIEW_MARKER = "oblark-excalidraw";
 const PREVIEW_EXPORT_SCALES = [3, 2, 1];
 const PREVIEW_EXPORT_SETTINGS = { withBackground: true, withTheme: true, isMask: false };
 // 导出配置指纹：变化时旧 binding 会被判定为需要重新导出
-const EXPORT_CONFIG_ID = "png-ladder-3-2-1:bg+theme";
-// 飞书素材上传上限 20MB，留出余量
-const PREVIEW_MAX_BYTES = 18 * 1024 * 1024;
-// Chromium canvas 单边上限，超过说明该倍率渲染不可靠
-const PREVIEW_MAX_EDGE = 16384;
+// v2：取消体积上限，只保留浏览器画布的硬限制
+const EXPORT_CONFIG_ID = "png-ladder-3-2-1:bg+theme:v2-nosizecap";
+// 不对 PNG 体积设上限：lark-cli 的 media-upload 对 >20MB 的文件会自动走分片上传
+// （见 `lark-cli docs +media-upload --help`：files > 20MB use multipart upload automatically）
+// 下面两个是 Chromium 画布的硬限制，不是飞书限制：超了渲染出来的是空白/破图，
+// 属于"渲染不可用"而不是"画质取舍"，所以必须继续拦。
+const PREVIEW_MAX_EDGE = 65535;
+const PREVIEW_MAX_PIXELS = 268435456;
 // 与 main.js 内联媒体替换用的正则保持一致，保证 map key 与被替换文本完全相同
 const WIKILINK_PATTERN = /!?\[\[[^\]|]+(?:\|[^\]]+)?\]\]/g;
 
@@ -261,12 +264,15 @@ async function renderDrawingPng(plugin, file) {
       }
 
       const size = readPngSize(bytes);
-      const tooLarge = bytes.length > PREVIEW_MAX_BYTES;
-      const tooWide = !!size && (size.width > PREVIEW_MAX_EDGE || size.height > PREVIEW_MAX_EDGE);
-      if ((tooLarge || tooWide) && scale !== lastScale) {
-        const reason = tooLarge ? `体积 ${bytes.length} 字节超过上限` : `尺寸 ${size.width}x${size.height} 超过上限`;
+      // 只在浏览器画布确实渲染不出来的情况下降级；体积多大都照传
+      const unrenderable = !!size
+        && (size.width > PREVIEW_MAX_EDGE
+          || size.height > PREVIEW_MAX_EDGE
+          || size.width * size.height > PREVIEW_MAX_PIXELS);
+      if (unrenderable && scale !== lastScale) {
+        const reason = `尺寸 ${size.width}x${size.height} 超过浏览器画布上限`;
         problems.push(`scale=${scale}: ${reason}`);
-        console.warn(`[ObLark Sync] Excalidraw 画布过大，降级导出倍率：${file.path}（${reason}）`);
+        console.warn(`[ObLark Sync] Excalidraw 画布超出浏览器渲染上限，降级导出倍率：${file.path}（${reason}）`);
         continue;
       }
 
